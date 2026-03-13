@@ -140,7 +140,7 @@ sdk:
 # Gateway Configuration (model gateway for AgentFlow-based training)
 gateway:
   port: 9090
-  host: "127.0.0.1"
+  host: null          # Auto-detects routable IP; set explicitly to override
   db_path: null       # Defaults to temp file
 
 # Episode Logging Configuration

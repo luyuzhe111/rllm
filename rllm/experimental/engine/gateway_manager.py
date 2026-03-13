@@ -12,6 +12,7 @@ vLLM server).
 from __future__ import annotations
 
 import logging
+import socket
 import subprocess
 import sys
 import threading
@@ -32,6 +33,42 @@ _HEALTH_POLL_INTERVAL = 0.5
 _HEALTH_POLL_TIMEOUT = 30.0
 
 
+def _get_routable_ip() -> str:
+    """Return the machine's routable IPv4 address.
+
+    Strategy (adapted from slime's ``get_host_info``):
+    1. UDP probe to 8.8.8.8 — queries kernel routing table without sending data
+    2. Fallback: ``socket.getaddrinfo(hostname)`` filtering out loopback
+    3. Last resort: ``127.0.0.1``
+    """
+
+    def _is_loopback(ip: str) -> bool:
+        return ip.startswith("127.") or ip == "::1"
+
+    # Strategy 1: UDP connect probe (most accurate)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip: str = s.getsockname()[0]
+            if not _is_loopback(ip):
+                return ip
+    except Exception:
+        pass
+
+    # Strategy 2: hostname resolution filtering out loopback
+    try:
+        hostname = socket.gethostname()
+        infos = socket.getaddrinfo(hostname, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        for info in infos:
+            ip = str(info[4][0])
+            if not _is_loopback(ip):
+                return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
+
+
 class GatewayManager:
     """Manages model gateway lifecycle for training.
 
@@ -42,7 +79,8 @@ class GatewayManager:
 
     def __init__(self, config: DictConfig, mode: str = "thread") -> None:
         gw_cfg = config.rllm.get("gateway", {})
-        self.host: str = gw_cfg.get("host", "127.0.0.1")
+        configured_host = gw_cfg.get("host", None)
+        self.host: str = configured_host if configured_host else _get_routable_ip()
         self.port: int = gw_cfg.get("port", 9090)
         self.db_path: str | None = gw_cfg.get("db_path", None)
         self.mode = mode
@@ -147,7 +185,7 @@ class GatewayManager:
 
         self._backend_server = TinkerBackendServer(
             rollout_engine=rollout_engine,
-            host=self.host,
+            host="0.0.0.0",
             port=backend_port,
             model_name=model_name,
         )
@@ -164,7 +202,7 @@ class GatewayManager:
             "-m",
             "rllm_model_gateway",
             "--host",
-            self.host,
+            "0.0.0.0",
             "--port",
             str(self.port),
         ]
@@ -181,10 +219,10 @@ class GatewayManager:
                 self.client.health()
                 logger.info("Gateway process healthy at %s", self.gateway_url)
                 return
-            except Exception:
+            except Exception as e:
                 if self._process.poll() is not None:
                     stderr = self._process.stderr.read().decode() if self._process.stderr else ""
-                    raise RuntimeError(f"Gateway process exited unexpectedly: {stderr}") from None
+                    raise RuntimeError(f"Gateway process exited unexpectedly: {stderr}") from e
                 time.sleep(_HEALTH_POLL_INTERVAL)
 
         self._process.terminate()
@@ -197,7 +235,7 @@ class GatewayManager:
         from rllm_model_gateway.server import create_app
 
         gw_config = GatewayConfig(
-            host=self.host,
+            host="0.0.0.0",
             port=self.port,
             db_path=self.db_path,
             store_worker="sqlite" if self.db_path else "memory",
@@ -206,7 +244,7 @@ class GatewayManager:
 
         uvi_config = uvicorn.Config(
             app,
-            host=self.host,
+            host="0.0.0.0",
             port=self.port,
             log_level="warning",
         )
